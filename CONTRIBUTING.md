@@ -14,7 +14,7 @@ Thank you for your interest in contributing to **Matric**! We are committed to b
 
 ### Getting the Code
 ```bash
-git clone https://github.com/your-username/matric.git
+git clone https://github.com/pawanbhayde/matric.git
 cd matric
 ```
 

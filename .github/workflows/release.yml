@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0 or v1.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build, Sign & Release DMG
+    runs-on: macos-14
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        id: get_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            RAW_VER="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            RAW_VER="${GITHUB_REF#refs/tags/}"
+          else
+            RAW_VER="1.0.0"
+          fi
+          CLEAN_VER="${RAW_VER#v}"
+          echo "version=${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "tag_name=v${CLEAN_VER}" >> $GITHUB_OUTPUT
+          echo "Building version ${CLEAN_VER} (Tag: v${CLEAN_VER})"
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -switch /Applications/Xcode_15.4.app || sudo xcode-select -switch /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Install Packaging Utilities
+        run: |
+          brew install create-dmg || true
+
+      - name: Setup Apple Developer ID Certificate (if provided)
+        id: setup_cert
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PWD: ${{ secrets.KEYCHAIN_PASSWORD || 'temporary-build-password' }}
+        run: |
+          if [ -n "$MACOS_CERTIFICATE" ] && [ -n "$MACOS_CERTIFICATE_PWD" ]; then
+            echo "==> Importing Apple Developer ID certificate..."
+            KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+            CERT_PATH=$RUNNER_TEMP/certificate.p12
+
+            echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+
+            security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+            security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+            # Discover identity name
+            SIGNING_ID=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -n 1 | sed -e 's/^[0-9]*) //; s/ ".*//; s/.*"\(.*\)".*/\1/' || true)
+
+            if [ -n "$SIGNING_ID" ]; then
+              echo "==> Found signing identity: ${SIGNING_ID}"
+              echo "signing_identity=${SIGNING_ID}" >> $GITHUB_OUTPUT
+            else
+              echo "==> No Developer ID found in certificate, falling back to ad-hoc."
+              echo "signing_identity=-" >> $GITHUB_OUTPUT
+            fi
+
+            rm -f "$CERT_PATH"
+          else
+            echo "==> No certificate secret provided. Using ad-hoc signing with hardened runtime."
+            echo "signing_identity=-" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and Package DMG
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+          SIGNING_IDENTITY: ${{ steps.setup_cert.outputs.signing_identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          chmod +x ./scripts/build_dmg.sh
+          ./scripts/build_dmg.sh
+
+      - name: Update Homebrew Cask Formula
+        id: update_cask
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          DMG_FILE="build/dist/Matric-${VERSION}.dmg"
+          SHA256=$(shasum -a 256 "$DMG_FILE" | awk '{print $1}')
+          
+          echo "DMG SHA256: ${SHA256}"
+          echo "sha256=${SHA256}" >> $GITHUB_OUTPUT
+
+          # Update Casks/matric.rb
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" Casks/matric.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Casks/matric.rb
+
+          echo "Updated Casks/matric.rb contents:"
+          cat Casks/matric.rb
+
+      - name: Commit Updated Cask to Repository
+        continue-on-error: true
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Casks/matric.rb
+          git commit -m "chore(release): update Homebrew Cask formula for v${{ steps.get_version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push origin HEAD:${{ github.ref_name }} || echo "Push skipped or branch protected"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.tag_name }}
+          name: "Matric v${{ steps.get_version.outputs.version }}"
+          draft: false
+          prerelease: false
+          files: |
+            build/dist/Matric-${{ steps.get_version.outputs.version }}.dmg
+            build/dist/Matric-${{ steps.get_version.outputs.version }}.dmg.sha256
+            build/dist/Matric.dmg
+            build/dist/Matric.dmg.sha256
+            Casks/matric.rb
+          body: |
+            ## Matric v${{ steps.get_version.outputs.version }}
+
+            Native, high-performance macOS system monitor & developer workspace companion.
+
+            ### 📦 Download & Installation
+
+            #### Method 1: Homebrew Cask (Recommended)
+            ```bash
+            # Install from this repository's Cask
+            brew install --cask https://raw.githubusercontent.com/pawanbhayde/matric/main/Casks/matric.rb
+
+            # Or install from tap (if tapped)
+            brew tap pawanbhayde/tap
+            brew install --cask matric
+            ```
+
+            #### Method 2: Direct DMG Download
+            1. Download [Matric-${{ steps.get_version.outputs.version }}.dmg](https://github.com/pawanbhayde/matric/releases/download/${{ steps.get_version.outputs.tag_name }}/Matric-${{ steps.get_version.outputs.version }}.dmg).
+            2. Double-click the DMG and drag **Matric.app** into your **Applications** folder.
+
+            ---
+
+            ### 🛡️ Note on macOS Gatekeeper & First Launch
+            Because Matric is open-source and free:
+            - If macOS displays *"Matric cannot be opened because Apple cannot check it for malicious software"* or *"developer cannot be verified"*:
+              - **Option A (Finder)**: In your `/Applications` folder, **Right-Click (or Control-Click) on Matric.app** and select **Open**, then click **Open** in the dialog. (Only required once).
+              - **Option B (Terminal)**: Remove macOS Gatekeeper quarantine attribute:
+                ```bash
+                xattr -cr /Applications/Matric.app
+                ```
+
+            ---
+
+            ### 🔒 Checksums (SHA-256)
+            ```
+            ${{ steps.update_cask.outputs.sha256 }}  Matric-${{ steps.get_version.outputs.version }}.dmg
+            ```
